@@ -102,7 +102,8 @@ def dpo_loss(chosen_log_ps_tr: torch.FloatTensor, chosen_log_ps_ref: torch.Float
 
     return loss_reduced, (preferred_logits - dispreferred_logits).detach().mean()
 
-def train_epoch(optimizer: torch.optim.Optimizer, dataloader, loop: Optional[tqdm.tqdm] = None):
+def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler, loop: Optional[tqdm.tqdm] = None):
+    global ALL_LOSS, ALL_REWARDS, total_steps
     average_reward_margin = []
     losses = []
     step_counter = 1
@@ -112,31 +113,48 @@ def train_epoch(optimizer: torch.optim.Optimizer, dataloader, loop: Optional[tqd
             chosen_log_probs_train, chosen_log_probs_reference, rejected_log_probs_train, rejected_log_probs_reference, rpo_loss = dpo_forward(batch, perform_rpo = True)
             batch_loss, reward_margin = dpo_loss(chosen_log_probs_train, chosen_log_probs_reference, rejected_log_probs_train, rejected_log_probs_reference, BETA, rpo_loss, ALPHA)
             accelerator.backward(batch_loss)
+            if accelerator.sync_gradients:
+                accelerator.clip_grad_norm_(model_tr.parameters(), max_norm=1.)
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad()
         losses.append(
+            batch_loss.detach().item()
+        )
+        ALL_LOSS.append(
             batch_loss.detach().item()
         )
         average_reward_margin.append(
             reward_margin.item()
         )
+        ALL_REWARDS.append(
+            reward_margin.item()
+        )
         step_counter += 1
+
         if loop:
-            loop.set_postfix(loss = losses[-1], rewards = average_reward_margin[-1], step_count = step_counter)
+            loop.set_postfix(loss = losses[-1], rewards = average_reward_margin[-1], step_count = f"{step_counter}/{total_steps}")
     return np.mean(losses), np.mean(average_reward_margin)
 
 
-optimizer = torch.optim.AdamW(model_tr.parameters(), weight_decay = .05, lr = 1e-5)
+optimizer = torch.optim.AdamW(model_tr.parameters(), weight_decay = .001, lr = 1e-5)
 TRAIN_LOSS = []
+ALL_LOSS = []
+ALL_REWARDS = []
 TRAIN_REWARD = []
 loop = tqdm.tqdm(range(1, NUM_EPOCHS+1), desc=f"Epoch 1/{NUM_EPOCHS}")
 
 model_tr, optimizer, dataloader_tr = accelerator.prepare(model_tr, optimizer, dataloader_tr)
+total_steps = len(dataloader_tr) * NUM_EPOCHS
+scheduler = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=100,
+    num_training_steps=total_steps,
+)
 
 for epoch in loop:
     loop.set_description(f"{epoch}/{NUM_EPOCHS}")
-    losses, rewards = train_epoch(optimizer, dataloader_tr, loop)
-
+    losses, rewards = train_epoch(optimizer, dataloader_tr, scheduler, loop)
     if TRAIN_LOSS==[]:
         best_model = True
     elif np.min(TRAIN_LOSS)>losses and np.max(TRAIN_REWARD)<rewards:
