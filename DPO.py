@@ -102,7 +102,7 @@ def dpo_loss(chosen_log_ps_tr: torch.FloatTensor, chosen_log_ps_ref: torch.Float
 
     return loss_reduced, (preferred_logits - dispreferred_logits).detach().mean()
 
-def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler, loop: Optional[tqdm.tqdm] = None):
+def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler:torch.optim.lr_scheduler.LambdaLR, loop: Optional[tqdm.tqdm] = None):
     global ALL_LOSS, ALL_REWARDS, total_steps
     average_reward_margin = []
     losses = []
