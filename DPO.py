@@ -153,7 +153,7 @@ scheduler = get_cosine_schedule_with_warmup(
 )
 
 for epoch in loop:
-    loop.set_description(f"{epoch}/{NUM_EPOCHS}")
+    loop.set_description(f"Epoch {epoch}/{NUM_EPOCHS}")
     losses, rewards = train_epoch(optimizer, dataloader_tr, scheduler, loop)
     if TRAIN_LOSS==[]:
         best_model = True
