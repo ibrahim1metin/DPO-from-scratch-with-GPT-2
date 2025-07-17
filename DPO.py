@@ -1,5 +1,5 @@
 from dataset import dataloader_tr, DataloaderOutput
-from utils import selective_log_softmax
+from utils import selective_log_softmax, generate_weight
 from hyperparams import *
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig, get_cosine_schedule_with_warmup
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
