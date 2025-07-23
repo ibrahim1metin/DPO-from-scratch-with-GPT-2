@@ -10,17 +10,14 @@ import torch.nn.functional as F
 from typing import Optional
 import numpy as np
 import tqdm
-
-accelerator = Accelerator(mixed_precision="fp16", gradient_accumulation_steps=ACC_STEPS)
+accelerator = Accelerator(gradient_accumulation_steps=ACC_STEPS,mixed_precision="bf16",)
 
 quant_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
+    load_in_8bit=True,
+    bnb_8bit_compute_dtype=torch.bfloat16,
 )
 model_tr = AutoModelForCausalLM.from_pretrained(
-    "gpt2-medium",
+    "gpt2-large",
     device_map="auto",
     quantization_config=quant_config,
     use_cache=False
@@ -30,8 +27,8 @@ model_tr = prepare_model_for_kbit_training(model_tr)
 lora_config = LoraConfig(
     r=16,
     lora_alpha=32,
-    target_modules=["c_attn", "c_proj"],
     lora_dropout=0.05,
+    target_modules=["c_attn", "c_proj"],
     bias="none",
     task_type="CAUSAL_LM",
 )
@@ -40,10 +37,10 @@ model_tr = get_peft_model(model_tr, lora_config)
 model_tr.train()
 
 model_ref = AutoModelForCausalLM.from_pretrained(
-    "gpt2-medium",
+    "gpt2-large",
     device_map="auto",
     quantization_config=quant_config,
-    use_cache=False,
+    use_cache=True,
 )
 model_ref.eval()
 
@@ -52,7 +49,6 @@ def dpo_forward(batch: DataloaderOutput, perform_rpo: bool = True):
     with accelerator.autocast():
       ch_outputs_tr = model_tr(
           input_ids=batch["chosen_input_ids"], attention_mask=batch["chosen_attention_mask"]).logits
-
       re_outputs_tr = model_tr(
           input_ids=batch["rejected_input_ids"], attention_mask=batch["rejected_attention_mask"]).logits
       with torch.no_grad():
@@ -79,14 +75,20 @@ def dpo_forward(batch: DataloaderOutput, perform_rpo: bool = True):
         re_outputs_ref, re_labels, re_loss_mask)
 
     if perform_rpo:
-        mask = ch_loss_mask[:,:-1].reshape(-1)
-        shifted_logits = ch_outputs_tr[:,:-1,:].flatten(end_dim = 1)
-        shifted_labels = ch_labels[:,:-1].flatten(end_dim = 1)
-        cross_entropy = F.cross_entropy(shifted_logits, shifted_labels, reduction = "none")
-        cross_entropy = cross_entropy.masked_fill(~mask, .0)
-        cross_entropy = cross_entropy.sum()/mask.sum()
+        logits = ch_outputs_tr[:, :-1, :]
+        labels = batch["chosen_input_ids"][:, 1:]
+        loss_mask = batch["chosen_loss_mask"][:, 1:]
 
-        return chosen_log_ps_tr.sum(dim=-1), chosen_log_ps_ref.sum(dim=-1), rejected_log_ps_tr.sum(dim=-1), rejected_log_ps_ref.sum(dim=-1), cross_entropy
+        logits = logits.reshape(-1, logits.size(-1))
+        labels = labels.reshape(-1)
+        loss_mask = loss_mask.reshape(-1).bool()
+
+        ce_loss = F.cross_entropy(logits, labels, reduction="none")
+        ce_loss = ce_loss.masked_fill(~loss_mask, 0.0)
+        ce_loss = ce_loss.sum() / loss_mask.sum()
+
+
+        return chosen_log_ps_tr.sum(dim=-1), chosen_log_ps_ref.sum(dim=-1), rejected_log_ps_tr.sum(dim=-1), rejected_log_ps_ref.sum(dim=-1), ce_loss
 
     return chosen_log_ps_tr.sum(dim=-1), chosen_log_ps_ref.sum(dim=-1), rejected_log_ps_tr.sum(dim=-1), rejected_log_ps_ref.sum(dim=-1)
 
@@ -99,11 +101,11 @@ def dpo_loss(chosen_log_ps_tr: torch.FloatTensor, chosen_log_ps_ref: torch.Float
 
     if alpha>0 and rpo_loss is not None:
         loss_reduced = loss_reduced + alpha * rpo_loss
+    reward_acc = (preferred_logits.detach()>dispreferred_logits.detach()).float().mean()
+    return loss_reduced, (preferred_logits - dispreferred_logits).detach().mean(), reward_acc
 
-    return loss_reduced, (preferred_logits - dispreferred_logits).detach().mean()
-
-def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler:torch.optim.lr_scheduler.LambdaLR, loop: Optional[tqdm.tqdm] = None):
-    global ALL_LOSS, ALL_REWARDS, total_steps
+def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler, loop: Optional[tqdm.tqdm] = None):
+    global ALL_LOSS, ALL_REWARDS, total_steps, ALL_ACCURACIES
     average_reward_margin = []
     losses = []
     step_counter = 1
@@ -111,7 +113,7 @@ def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler:torch.op
     for batch in dataloader:
         with accelerator.accumulate(model_tr):
             chosen_log_probs_train, chosen_log_probs_reference, rejected_log_probs_train, rejected_log_probs_reference, rpo_loss = dpo_forward(batch, perform_rpo = True)
-            batch_loss, reward_margin = dpo_loss(chosen_log_probs_train, chosen_log_probs_reference, rejected_log_probs_train, rejected_log_probs_reference, BETA, rpo_loss, ALPHA)
+            batch_loss, reward_margin, acc = dpo_loss(chosen_log_probs_train, chosen_log_probs_reference, rejected_log_probs_train, rejected_log_probs_reference, BETA, rpo_loss, ALPHA)
             accelerator.backward(batch_loss)
             if accelerator.sync_gradients:
                 accelerator.clip_grad_norm_(model_tr.parameters(), max_norm=1.)
@@ -130,17 +132,21 @@ def train_epoch(optimizer: torch.optim.Optimizer, dataloader, scheduler:torch.op
         ALL_REWARDS.append(
             reward_margin.item()
         )
+        ALL_ACCURACIES.append(
+            acc.item()
+        )
         step_counter += 1
 
         if loop:
-            loop.set_postfix(loss = losses[-1], rewards = average_reward_margin[-1], step_count = f"{step_counter}/{total_steps}")
+            loop.set_postfix(loss = losses[-1], rewards = average_reward_margin[-1], step_count = f"{step_counter}/{total_steps//NUM_EPOCHS}", accuracy = acc.item())
     return np.mean(losses), np.mean(average_reward_margin)
 
 
-optimizer = torch.optim.AdamW(model_tr.parameters(), weight_decay = .001, lr = 1e-5)
+optimizer = bnb.optim.AdamW(model_tr.parameters(), weight_decay = .005, lr = 2e-5, is_paged = True)
 TRAIN_LOSS = []
 ALL_LOSS = []
 ALL_REWARDS = []
+ALL_ACCURACIES = []
 TRAIN_REWARD = []
 loop = tqdm.tqdm(range(1, NUM_EPOCHS+1), desc=f"Epoch 1/{NUM_EPOCHS}")
 
@@ -148,12 +154,12 @@ model_tr, optimizer, dataloader_tr = accelerator.prepare(model_tr, optimizer, da
 total_steps = len(dataloader_tr) * NUM_EPOCHS
 scheduler = get_cosine_schedule_with_warmup(
     optimizer,
-    num_warmup_steps=100,
+    num_warmup_steps=500,
     num_training_steps=total_steps,
 )
 
 for epoch in loop:
-    loop.set_description(f"Epoch {epoch}/{NUM_EPOCHS}")
+    loop.set_description(f"EPOCH {epoch}/{NUM_EPOCHS}")
     losses, rewards = train_epoch(optimizer, dataloader_tr, scheduler, loop)
     if TRAIN_LOSS==[]:
         best_model = True
