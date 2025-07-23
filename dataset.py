@@ -142,4 +142,4 @@ def collate_fn(batch, add_bos=False, truncation = True) -> DataloaderOutput:
 
 dataset_tr = DPO_Dataset()
 dataloader_tr = DataLoader(
-    dataset=dataset_tr, batch_size=16, collate_fn=partial(collate_fn,truncation=True, add_bos = False))
+    dataset=dataset_tr, batch_size=8, collate_fn=partial(collate_fn,truncation=True, add_bos = False))

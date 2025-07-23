@@ -1,4 +1,5 @@
+DEVICE = "cuda"
 NUM_EPOCHS = 5
-ALPHA = .05
-BETA = .1
-ACC_STEPS = 8
+ALPHA = 1.
+BETA = 0.5
+ACC_STEPS = 16
